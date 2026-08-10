@@ -244,6 +244,153 @@ def queryArchitecture(api, gene, dataset='cifar10', hp='200', is_random=False):
     }
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Validation / test split
+# ─────────────────────────────────────────────────────────────────────────────
+
+# NAS-Bench-201 exposes a dedicated 'cifar10-valid' entry (trained on 25k,
+# scored on the held-out 25k). The plain 'cifar10' entry is trained on the full
+# 50k and has NO honest validation split — its 'valid-accuracy' is None, so
+# searching on r['valid_acc'] there would collapse every architecture to 0.0
+# and flatten the fitness landscape. CIFAR-100 and ImageNet16-120 carry both
+# splits in the same entry.
+_SEARCH_DATASET = {
+    'cifar10':        'cifar10-valid',
+    'cifar10-valid':  'cifar10-valid',
+    'cifar100':       'cifar100',
+    'ImageNet16-120': 'ImageNet16-120',
+}
+_REPORT_DATASET = {
+    'cifar10':        'cifar10',
+    'cifar10-valid':  'cifar10',
+    'cifar100':       'cifar100',
+    'ImageNet16-120': 'ImageNet16-120',
+}
+
+
+# Memoized benchmark lookups.
+#
+# NAS-Bench-201 is a static table, so re-querying an architecture returns the
+# identical result. The NATS-Bench API caches every architecture it loads and
+# never evicts, so a long sweep (hundreds of runs x 1020 evaluations) grows
+# without bound until the machine runs out of memory. Memoizing here means each
+# architecture is fetched from the API at most once per (dataset, hp), after
+# which it is evicted from the API's own store (see _releaseApiParams).
+#
+# This is purely a read cache: it does not touch the evaluation counters, the
+# eval log, or n_unique_architectures. A run produces exactly the numbers it
+# would produce without it.
+_QUERY_CACHE = {}
+
+
+def clearQueryCache():
+    """Drop the memoized lookups (e.g. between datasets, to cap memory)."""
+    n = len(_QUERY_CACHE)
+    _QUERY_CACHE.clear()
+    return n
+
+
+# Whether to drop each architecture from the NATS-Bench store once we have
+# copied what we need. Set False (setApiEviction(False)) to fall back to the
+# library's own behaviour.
+_EVICT_API = True
+_EVICT_WARNED = False
+
+
+def setApiEviction(enabled):
+    """Turn eviction of the NATS-Bench in-memory store on or off."""
+    global _EVICT_API
+    _EVICT_API = bool(enabled)
+    return _EVICT_API
+
+
+def _releaseApiParams(api, index, hp):
+    """Drop an architecture from the NATS-Bench in-memory store.
+
+    Measured on NATS-tss-v1_0: each architecture the API loads costs ~1.8 MiB
+    and is never released, so ``arch2infos_dict`` grows monotonically. Touching
+    the whole 15,625-cell space would need roughly 28 GB — which is what
+    exhausted the machine during a full sweep.
+
+    ``clear_params`` only frees network weights, not the per-epoch metric
+    records (``ArchResults`` / ``ResultsCount``) that actually dominate, so the
+    entry itself has to go. This is safe because :func:`queryValidTest` has
+    already copied everything we need into ``_QUERY_CACHE``, and NATS-Bench
+    reloads an evicted index on demand.
+
+    ``arch2infos_dict`` and ``evaluated_indexes`` are always updated together;
+    leaving one populated and the other not would make the API believe an
+    architecture is loaded when it is not.
+    """
+    global _EVICT_WARNED
+    if not _EVICT_API or index is None:
+        return
+
+    # Free the weights too, when the version exposes it. Cheap, and harmless
+    # if the entry is about to be dropped anyway.
+    fn = getattr(api, 'clear_params', None)
+    if fn is not None:
+        try:
+            fn(index, hp)
+        except TypeError:
+            try:
+                fn(index)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    store = getattr(api, 'arch2infos_dict', None)
+    if not isinstance(store, dict):
+        if not _EVICT_WARNED:
+            _EVICT_WARNED = True
+            print('[utils.nas] AVISO: nao encontrei arch2infos_dict na API; '
+                  'a memoria vai crescer ~1.8 MiB por arquitectura. '
+                  'Corre diagnose_memory.ipynb para identificar o atributo.')
+        return
+
+    store.pop(index, None)
+    seen = getattr(api, 'evaluated_indexes', None)
+    if isinstance(seen, set):
+        seen.discard(index)
+    elif isinstance(seen, list):
+        try:
+            seen.remove(index)
+        except ValueError:
+            pass
+
+
+def queryValidTest(api, gene, dataset='cifar10', hp='200'):
+    """Query one architecture, returning both accuracies.
+
+    A superset of :func:`queryArchitecture`'s dict: every cost field comes from
+    the reporting entry, ``valid_acc`` from the search entry. ``valid_acc``
+    drives the search; ``test_acc`` is read only for the architecture a run
+    finally returns.
+
+    Results are memoized (see :data:`_QUERY_CACHE`); a copy is returned so a
+    caller cannot corrupt the cache.
+    """
+    key = (tuple(int(g) for g in gene), dataset, hp)
+    hit = _QUERY_CACHE.get(key)
+    if hit is not None:
+        return dict(hit)
+
+    s_ds = _SEARCH_DATASET.get(dataset, dataset)
+    r_ds = _REPORT_DATASET.get(dataset, dataset)
+    sv = queryArchitecture(api, gene, dataset=s_ds, hp=hp)
+    tv = sv if r_ds == s_ds else queryArchitecture(api, gene, dataset=r_ds, hp=hp)
+    out = dict(tv)
+    out['valid_acc'] = sv.get('valid_acc')
+    out['test_acc'] = tv.get('test_acc')
+
+    _QUERY_CACHE[key] = out
+    # Everything needed is now held locally, so the API copy is dead weight.
+    _releaseApiParams(api, out.get('index'), hp)
+    return dict(out)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Objective for mealpy-style optimizers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -293,8 +440,8 @@ def makeNASObjective(
     def objective(solution):
         gene = [int(np.round(x)) for x in solution]
         try:
-            r = queryArchitecture(api, gene, dataset=dataset, hp=hp)
-            acc = r[fitness_key] or 0.0
+            r = queryValidTest(api, gene, dataset=dataset, hp=hp)
+            acc = r[fitness_key] or 0.0   # fitness_key='valid_acc' => no leakage
         except Exception as e:
             print(f"  [ERROR] query failed at eval {counter['n']+1}: "
                   f"{type(e).__name__}: {e}")
@@ -425,8 +572,12 @@ def runNASSearch(
 
     best_gene    = [int(np.round(x)) for x in g_best.solution]
     best_fitness = float(g_best.target.fitness)
-    best_test_acc = 1.0 - best_fitness
-    best_query   = queryArchitecture(api, best_gene, dataset=dataset, hp=hp)
+    # Re-query rather than inverting the fitness: with fitness_key='valid_acc'
+    # 1 - fitness is the VALIDATION accuracy, and reporting it as test_acc
+    # would mislabel the result.
+    best_query    = queryValidTest(api, best_gene, dataset=dataset, hp=hp)
+    best_valid_acc = best_query['valid_acc'] or 0.0
+    best_test_acc  = best_query['test_acc'] or 0.0
 
     if verbose:
         print(f"\n{'='*62}")
@@ -666,9 +817,10 @@ def runBONASSearch(
 
     best_params   = bo.max['params']
     best_gene     = [int(np.round(best_params[f'e{i}'])) for i in range(N_EDGES)]
-    best_query    = queryArchitecture(api, best_gene, dataset=dataset, hp=hp)
-    best_test_acc = best_query['test_acc']
-    best_fitness  = 1.0 - best_test_acc
+    best_query     = queryValidTest(api, best_gene, dataset=dataset, hp=hp)
+    best_valid_acc = best_query['valid_acc'] or 0.0
+    best_test_acc  = best_query['test_acc'] or 0.0
+    best_fitness   = 1.0 - best_valid_acc
 
     if verbose:
         print(f"\n{'='*62}")

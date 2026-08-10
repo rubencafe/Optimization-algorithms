@@ -342,6 +342,39 @@ def computeTrueParetoFront(api, dataset='cifar10', hp='200', fitness_key='test_a
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Validation / test split
+# ─────────────────────────────────────────────────────────────────────────────
+
+# queryValidTest lives in utils.nas so both pipelines share a single memoized
+# cache instead of each keeping its own. See the note there on why the lookups
+# are memoized: the NATS-Bench API caches every architecture it loads and never
+# evicts, so a long sweep grows without bound.
+from utils.nas import queryValidTest, clearQueryCache          # noqa: E402
+
+
+def scoredPoint(api, gene, dataset, hp, flops_min, flops_max, **extra):
+    """Final record for one architecture.
+
+    ``f1``/``f2`` are on TEST accuracy so hypervolume and IGD+ stay comparable
+    with the exhaustive reference front, which is also defined on test.
+    """
+    r = queryValidTest(api, gene, dataset=dataset, hp=hp)
+    nf = _normFlops(r['flops_M'], flops_min, flops_max)
+    return {
+        'gene':       list(gene),
+        'arch_index': r['index'],
+        'arch_str':   r['arch_str'],
+        'valid_acc':  round(r['valid_acc'], 6),
+        'test_acc':   round(r['test_acc'], 6),
+        'flops_M':    round(r['flops_M'], 4),
+        'norm_flops': round(nf, 6),
+        'f1':         round(1.0 - r['test_acc'], 6),
+        'f2':         round(nf, 6),
+        **extra,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Scalarised objective (for mealpy single-objective algorithms)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -356,13 +389,13 @@ def makeScalarizedObjective(api, dataset='cifar10', hp='200', alpha=0.5, flops_m
     def objective(solution):
         gene = [int(np.round(x)) for x in solution]
         try:
-            r   = queryArchitecture(api, gene, dataset=dataset, hp=hp)
-            acc   = r['test_acc']  or 0.0
-            flops = r['flops_M']   or 0.0
+            r   = queryValidTest(api, gene, dataset=dataset, hp=hp)
+            acc   = r['valid_acc']  or 0.0   # SEARCH SIGNAL: validation only
+            flops = r['flops_M']    or 0.0
         except Exception as e:
             print(f"  [ERROR] query failed: {e}")
             acc, flops = 0.0, 0.0
-            r = {'index': -1, 'arch_str': '?', 'train_all_time': 0.0,
+            r = {'index': -1, 'arch_str': '?', 'valid_acc': 0.0,
                  'test_acc': 0.0, 'flops_M': 0.0}
 
         nf      = _normFlops(flops, flops_min, flops_max)
@@ -380,7 +413,8 @@ def makeScalarizedObjective(api, dataset='cifar10', hp='200', alpha=0.5, flops_m
             'arch_index': r['index'],
             'arch_str':   r['arch_str'],
             'gene':       ' '.join(str(g) for g in gene),
-            'test_acc':   round(acc, 6),
+            'valid_acc':  round(acc, 6),
+            'test_acc':   round(r.get('test_acc', 0.0), 6),
             'flops_M':    round(flops, 4),
             'norm_flops': round(nf, 6),
             'f1':         round(f1, 6),
@@ -392,7 +426,7 @@ def makeScalarizedObjective(api, dataset='cifar10', hp='200', alpha=0.5, flops_m
 
         if verbose:
             print(f"  [{counter['n']:>4}] gene={gene}  "
-                  f"acc={acc:.4f}  flops={flops:.1f}M  "
+                  f"valid_acc={acc:.4f}  flops={flops:.1f}M  "
                   f"fitness(α={alpha})={fitness:.4f}")
 
         return fitness
@@ -454,13 +488,15 @@ class NASMOProblem:
                     gene = [int(round(v)) for v in x]
                     gene = [max(0, min(N_OPS - 1, g)) for g in gene]
                     try:
-                        r = queryArchitecture(outer.api, gene, dataset=outer.dataset, hp=outer.hp,)
-                        acc = r['test_acc']  or 0.0
-                        flops = r['flops_M']   or 0.0
+                        r = queryValidTest(outer.api, gene,
+                                           dataset=outer.dataset, hp=outer.hp)
+                        acc = r['valid_acc'] or 0.0   # SEARCH SIGNAL
+                        flops = r['flops_M']  or 0.0
                     except Exception as e:
                         print(f"  [ERROR] {e}")
                         acc, flops, r = 0.0, 0.0, {
-                            'index': -1, 'arch_str': '?', 'train_all_time': 0.0,
+                            'index': -1, 'arch_str': '?', 'valid_acc': 0.0,
+                            'test_acc': 0.0,
                         }
 
                     nf = _normFlops(flops, outer.flops_min, outer.flops_max)
@@ -475,7 +511,8 @@ class NASMOProblem:
                         'arch_index': r.get('index', -1),
                         'arch_str':   r.get('arch_str', '?'),
                         'gene':       ' '.join(str(g) for g in gene),
-                        'test_acc':   round(acc, 6),
+                        'valid_acc':  round(acc, 6),
+                        'test_acc':   round(r.get('test_acc', 0.0), 6),
                         'flops_M':    round(flops, 4),
                         'norm_flops': round(nf, 6),
                         'f1':         round(f1, 6),
@@ -487,7 +524,7 @@ class NASMOProblem:
 
                     if outer.verbose:
                         print(f"  [{outer.counter['n']:>4}] "
-                              f"gene={gene}  acc={acc:.4f}  "
+                              f"gene={gene}  valid_acc={acc:.4f}  "
                               f"flops={flops:.1f}M")
 
                 out['F'] = F
@@ -499,27 +536,49 @@ class NASMOProblem:
 # HV-tracking callback for NSGA-II
 # ─────────────────────────────────────────────────────────────────────────────
 
-class _HVCallback:
-    """Tracks hypervolume of the current Pareto front after each generation."""
+def _hvOfArchive(objs):
+    """Hypervolume of everything evaluated so far.
 
-    def __init__(self, ref_point=REF_POINT):
-        self.ref_point  = ref_point
-        self.hv_history = []
-        self._hv_obj    = None  # lazily constructed
+    ``computeHypervolume`` already reduces to the non-dominated subset.
+    """
+    return computeHypervolume(objs) if objs else 0.0
+
+
+class _HVCallback:
+    """Tracks hypervolume after each generation.
+
+    The optimizer's own ``algorithm.opt`` front is in VALIDATION objectives
+    (that is what it searches on), but the reported hypervolume — and the
+    reference front it is compared against — are on TEST. Tracing the
+    validation front here would produce a convergence curve that never lands
+    on the final reported value. So the trace is rebuilt from the eval log,
+    which carries the test score of every architecture evaluated so far.
+    Both traces are kept: ``hv_history`` (test) and ``hv_history_valid``.
+    """
+
+    def __init__(self, ref_point=REF_POINT, eval_log=None):
+        self.ref_point        = ref_point
+        self.hv_history       = []
+        self.hv_history_valid = []
+        self.eval_log         = eval_log
+        self._hv_obj          = None  # lazily constructed
 
     def _hv(self):
         if self._hv_obj is None:
-            
             self._hv_obj = HV(ref_point=self.ref_point)
         return self._hv_obj
 
     def __call__(self, algorithm):
-        F = algorithm.opt.get('F')   # non-dominated front objectives
-        if F is not None and len(F) > 0:
-            hv = float(self._hv()(F))
+        F = algorithm.opt.get('F')   # validation-space front
+        self.hv_history_valid.append(
+            float(self._hv()(F)) if F is not None and len(F) else 0.0)
+
+        if self.eval_log:
+            pts = [[1.0 - (e.get('test_acc') or 0.0), e.get('norm_flops') or 0.0]
+                   for e in self.eval_log]
+            self.hv_history.append(_hvOfArchive(pts))
         else:
-            hv = 0.0
-        self.hv_history.append(hv)
+            self.hv_history.append(self.hv_history_valid[-1])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -583,7 +642,7 @@ def runNSGAIINASSearch(
     counter['start'] = time.time()
 
     # HV callback
-    hv_cb = _HVCallback(REF_POINT)
+    hv_cb = _HVCallback(REF_POINT, eval_log=eval_log)
 
     # NSGA-II setup — SBX crossover + polynomial mutation, both float-encoded
     # with rounding on evaluation (standard practice for integer NAS spaces).
@@ -614,19 +673,13 @@ def runNSGAIINASSearch(
     for f_vec, x_vec in zip(F_final, X_final):
         gene  = [max(0, min(N_OPS - 1, int(round(v)))) for v in x_vec]
         try:
-            r = queryArchitecture(api, gene, dataset=dataset, hp=hp)
+            pt = scoredPoint(api, gene, dataset, hp, flops_min, flops_max,
+                             f1_valid=round(float(f_vec[0]), 6))
         except Exception:
-            r = {'index': -1, 'arch_str': '?', 'test_acc': 0.0, 'flops_M': 0.0}
-        pareto_front.append({
-            'gene':       gene,
-            'arch_index': r.get('index', -1),
-            'arch_str':   r.get('arch_str', '?'),
-            'test_acc':   round(float(r.get('test_acc') or 0.0), 6),
-            'flops_M':    round(float(r.get('flops_M') or 0.0), 4),
-            'norm_flops': round(float(f_vec[1]), 6),
-            'f1':         round(float(f_vec[0]), 6),
-            'f2':         round(float(f_vec[1]), 6),
-        })
+            pt = {'gene': gene, 'arch_index': -1, 'arch_str': '?',
+                  'valid_acc': 0.0, 'test_acc': 0.0, 'flops_M': 0.0,
+                  'norm_flops': 0.0, 'f1': 1.0, 'f2': 0.0, 'f1_valid': 1.0}
+        pareto_front.append(pt)
 
     # Sort by f1 (ascending accuracy gap)
     pareto_front.sort(key=lambda p: p['f1'])
@@ -666,6 +719,7 @@ def runNSGAIINASSearch(
         'pareto_front':        pareto_front,
         'hypervolume':         round(final_hv, 8),
         'hv_history':          [round(h, 8) for h in hv_cb.hv_history],
+        'hv_history_valid':    [round(h, 8) for h in hv_cb.hv_history_valid],
         'n_evaluations':       counter['n'],
         'n_unique_architectures': len({e['arch_index'] for e in eval_log}),
         'total_time_s':        round(t_total, 1),
@@ -681,6 +735,7 @@ def runNSGAIINASSearch(
     df.to_csv(csv_path, index=False)
 
     print(f"  Saved: {json_path}")
+    gc.collect()   # the run's eval log is dead by here; reclaim it
     return pareto_front, run_results
 
 
@@ -740,7 +795,7 @@ def _runPymooMONASSearch(
     counter['start'] = time.time()
 
     # HV callback (per-generation history of the non-dominated front)
-    hv_cb = _HVCallback(REF_POINT)
+    hv_cb = _HVCallback(REF_POINT, eval_log=eval_log)
 
     t0 = time.time()
     result = minimize(
@@ -766,19 +821,13 @@ def _runPymooMONASSearch(
     for f_vec, x_vec in zip(F_final, X_final):
         gene = [max(0, min(N_OPS - 1, int(round(v)))) for v in x_vec]
         try:
-            r = queryArchitecture(api, gene, dataset=dataset, hp=hp)
+            pt = scoredPoint(api, gene, dataset, hp, flops_min, flops_max,
+                             f1_valid=round(float(f_vec[0]), 6))
         except Exception:
-            r = {'index': -1, 'arch_str': '?', 'test_acc': 0.0, 'flops_M': 0.0}
-        pareto_front.append({
-            'gene':       gene,
-            'arch_index': r.get('index', -1),
-            'arch_str':   r.get('arch_str', '?'),
-            'test_acc':   round(float(r.get('test_acc') or 0.0), 6),
-            'flops_M':    round(float(r.get('flops_M') or 0.0), 4),
-            'norm_flops': round(float(f_vec[1]), 6),
-            'f1':         round(float(f_vec[0]), 6),
-            'f2':         round(float(f_vec[1]), 6),
-        })
+            pt = {'gene': gene, 'arch_index': -1, 'arch_str': '?',
+                  'valid_acc': 0.0, 'test_acc': 0.0, 'flops_M': 0.0,
+                  'norm_flops': 0.0, 'f1': 1.0, 'f2': 0.0, 'f1_valid': 1.0}
+        pareto_front.append(pt)
 
     pareto_front.sort(key=lambda p: p['f1'])
     final_hv = (computeHypervolume([[p['f1'], p['f2']] for p in pareto_front])
@@ -814,6 +863,7 @@ def _runPymooMONASSearch(
         'pareto_front':           pareto_front,
         'hypervolume':            round(final_hv, 8),
         'hv_history':             [round(h, 8) for h in hv_cb.hv_history],
+        'hv_history_valid':       [round(h, 8) for h in hv_cb.hv_history_valid],
         'n_evaluations':          counter['n'],
         'n_unique_architectures': len({e['arch_index'] for e in eval_log}),
         'total_time_s':           round(t_total, 1),
@@ -829,6 +879,7 @@ def _runPymooMONASSearch(
         index=False)
 
     print(f"  Saved: {json_path}")
+    gc.collect()   # the run's eval log is dead by here; reclaim it
     return pareto_front, run_results
 
 
@@ -902,6 +953,7 @@ def runGDE3NASSearch(
     )
     # Record the DE-specific hyperparameters for reproducibility.
     run_results['config'].update({'CR': CR, 'F': F, 'variant': variant})
+    gc.collect()   # the run's eval log is dead by here; reclaim it
     return pareto_front, run_results
 
 
@@ -984,32 +1036,17 @@ def runMONASScalarized(
     best_gene = [int(np.round(x)) for x in g_best.solution]
     best_gene = [max(0, min(N_OPS - 1, g)) for g in best_gene]
 
-    try:
-        r = queryArchitecture(api, best_gene, dataset=dataset, hp=hp)
-        acc   = r['test_acc']  or 0.0
-        flops = r['flops_M']   or 0.0
-    except Exception:
-        r, acc, flops = {'index': -1, 'arch_str': '?'}, 0.0, 0.0
+    best_point = scoredPoint(api, best_gene, dataset, hp, flops_min, flops_max,
+                             alpha=alpha)
+    # The search fitness is on validation; the reported f1 is on test.
+    best_point['fitness'] = round(
+        alpha * (1.0 - best_point['valid_acc'])
+        + (1 - alpha) * best_point['norm_flops'], 6)
 
-    nf = _normFlops(flops, flops_min, flops_max)
-    f1 = 1.0 - acc
-    f2 = nf
-
-    print(f"→ acc={acc:.4f}  flops={flops:.1f}M  "
-          f"fit={alpha*f1+(1-alpha)*f2:.4f}  t={t_total:.0f}s")
-
-    best_point = {
-        'gene':       best_gene,
-        'arch_index': r.get('index', -1),
-        'arch_str':   r.get('arch_str', '?'),
-        'test_acc':   round(acc, 6),
-        'flops_M':    round(flops, 4),
-        'norm_flops': round(nf, 6),
-        'f1':         round(f1, 6),
-        'f2':         round(f2, 6),
-        'fitness':    round(alpha * f1 + (1 - alpha) * f2, 6),
-        'alpha':      alpha,
-    }
+    print(f"→ valid={best_point['valid_acc']:.4f}  "
+          f"test={best_point['test_acc']:.4f}  "
+          f"flops={best_point['flops_M']:.1f}M  "
+          f"fit={best_point['fitness']:.4f}  t={t_total:.0f}s")
 
     os.makedirs(results_dir, exist_ok=True)
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -1030,7 +1067,7 @@ def runMONASScalarized(
             'ref_point':     list(REF_POINT),
         },
         'best':             best_point,
-        'hypervolume':      round(computeHypervolume([[f1, f2]]), 8),
+        'hypervolume':      round(computeHypervolume([[best_point['f1'], best_point['f2']]]), 8),
         'hv_history':       [],    # not available for single-obj algorithms
         'n_evaluations':    counter['n'],
         'n_unique_architectures': len({e['arch_index'] for e in eval_log}),
@@ -1047,6 +1084,7 @@ def runMONASScalarized(
     csv_path = json_path.replace('.json', '_evals.csv')
     df.to_csv(csv_path, index=False)
 
+    gc.collect()   # the run's eval log is dead by here; reclaim it
     return best_point, run_results
 
 
@@ -1127,6 +1165,7 @@ def runMONASScalarizedSweep(
     print(f"\n  {alg_name} sweep done — "
           f"|front|={len(front)}  HV={final_hv:.6f}")
 
+    gc.collect()   # the run's eval log is dead by here; reclaim it
     return front, all_points
 
 
@@ -1199,31 +1238,16 @@ def runBOMONASScalarized(
     best_params = bo.max['params']
     best_gene   = [max(0, min(N_OPS - 1, int(round(best_params[f'e{j}']))))
                    for j in range(N_EDGES)]
-    try:
-        r     = queryArchitecture(api, best_gene, dataset=dataset, hp=hp)
-        acc   = r['test_acc']  or 0.0
-        flops = r['flops_M']   or 0.0
-    except Exception:
-        r, acc, flops = {'index': -1, 'arch_str': '?'}, 0.0, 0.0
-
-    nf = _normFlops(flops, flops_min, flops_max)
-    f1, f2 = 1.0 - acc, nf
+    best_point = scoredPoint(api, best_gene, dataset, hp, flops_min, flops_max,
+                             alpha=alpha)
+    best_point['fitness'] = round(
+        alpha * (1.0 - best_point['valid_acc'])
+        + (1 - alpha) * best_point['norm_flops'], 6)
 
     print(f"  [BO  α={alpha:.1f}  seed={seed}]  {dataset}  "
-          f"→ acc={acc:.4f}  flops={flops:.1f}M  t={t_total:.0f}s")
-
-    best_point = {
-        'gene':       best_gene,
-        'arch_index': r.get('index', -1),
-        'arch_str':   r.get('arch_str', '?'),
-        'test_acc':   round(acc, 6),
-        'flops_M':    round(flops, 4),
-        'norm_flops': round(nf, 6),
-        'f1':         round(f1, 6),
-        'f2':         round(f2, 6),
-        'fitness':    round(alpha * f1 + (1 - alpha) * f2, 6),
-        'alpha':      alpha,
-    }
+          f"→ valid={best_point['valid_acc']:.4f}  "
+          f"test={best_point['test_acc']:.4f}  "
+          f"flops={best_point['flops_M']:.1f}M  t={t_total:.0f}s")
 
     os.makedirs(results_dir, exist_ok=True)
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -1239,7 +1263,7 @@ def runBOMONASScalarized(
             'ref_point': list(REF_POINT),
         },
         'best':        best_point,
-        'hypervolume': round(computeHypervolume([[f1, f2]]), 8),
+        'hypervolume': round(computeHypervolume([[best_point['f1'], best_point['f2']]]), 8),
         'hv_history':  [],
         'n_evaluations':          counter['n'],
         'n_unique_architectures': len({e['arch_index'] for e in eval_log}),
@@ -1254,6 +1278,7 @@ def runBOMONASScalarized(
     pd.DataFrame(eval_log).to_csv(
         json_path.replace('.json', '_evals.csv'), index=False)
 
+    gc.collect()   # the run's eval log is dead by here; reclaim it
     return best_point, run_results
 
 
@@ -1340,31 +1365,16 @@ def runBOMONASScalarizedSweep(
         best_params = bo.max['params']
         best_gene   = [max(0, min(N_OPS - 1, int(round(best_params[f'e{j}']))))
                        for j in range(N_EDGES)]
-        try:
-            r     = queryArchitecture(api, best_gene, dataset=dataset, hp=hp)
-            acc   = r['test_acc']  or 0.0
-            flops = r['flops_M']   or 0.0
-        except Exception:
-            r, acc, flops = {'index': -1, 'arch_str': '?'}, 0.0, 0.0
-
-        nf = _normFlops(flops, flops_min, flops_max)
-        f1, f2 = 1.0 - acc, nf
+        best_point = scoredPoint(api, best_gene, dataset, hp,
+                                 flops_min, flops_max, alpha=alpha)
+        best_point['fitness'] = round(
+            alpha * (1.0 - best_point['valid_acc'])
+            + (1 - alpha) * best_point['norm_flops'], 6)
 
         print(f"  [BO  α={alpha:.1f}  seed={run_seed}] "
-              f"acc={acc:.4f}  flops={flops:.1f}M  t={t_total:.0f}s")
-
-        best_point = {
-            'gene':       best_gene,
-            'arch_index': r.get('index', -1),
-            'arch_str':   r.get('arch_str', '?'),
-            'test_acc':   round(acc, 6),
-            'flops_M':    round(flops, 4),
-            'norm_flops': round(nf, 6),
-            'f1':         round(f1, 6),
-            'f2':         round(f2, 6),
-            'fitness':    round(alpha * f1 + (1 - alpha) * f2, 6),
-            'alpha':      alpha,
-        }
+              f"valid={best_point['valid_acc']:.4f}  "
+              f"test={best_point['test_acc']:.4f}  "
+              f"flops={best_point['flops_M']:.1f}M  t={t_total:.0f}s")
         all_points.append(best_point)
 
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -1380,7 +1390,7 @@ def runBOMONASScalarizedSweep(
                 'ref_point': list(REF_POINT),
             },
             'best':        best_point,
-            'hypervolume': round(computeHypervolume([[f1, f2]]), 8),
+            'hypervolume': round(computeHypervolume([[best_point['f1'], best_point['f2']]]), 8),
             'hv_history':  [],
             'n_evaluations':   counter['n'],
             'n_unique_architectures': len({e['arch_index'] for e in eval_log}),
@@ -1401,6 +1411,7 @@ def runBOMONASScalarizedSweep(
     hv     = computeHypervolume([[p['f1'], p['f2']] for p in front])
 
     print(f"\n  BO sweep done — |front|={len(front)}  HV={hv:.6f}")
+    gc.collect()   # the run's eval log is dead by here; reclaim it
     return front, all_points
 
 
@@ -1518,7 +1529,8 @@ def runQEHVINASSearch(
     counter      = {'n': 0, 'start': time.time()}
     hv_history   = []
     hv_indicator = HV(ref_point=REF_POINT)
-    all_min_objs = []   # [[f1, f2], …] for the running front / HV (min space)
+    all_min_objs = []   # [[f1, f2], …] VALIDATION — drives the GP and the front
+    all_test_objs = []  # [[f1, f2], …] TEST — what the HV trace reports
     all_records  = []   # parallel full point dicts
 
     def _unit_to_gene(x_unit):
@@ -1531,12 +1543,14 @@ def runQEHVINASSearch(
         for i in range(X_unit.shape[0]):
             gene = _unit_to_gene(X_unit[i].tolist())
             try:
-                r     = queryArchitecture(api, gene, dataset=dataset, hp=hp)
-                acc   = r['test_acc'] or 0.0
-                flops = r['flops_M']  or 0.0
+                r     = queryValidTest(api, gene, dataset=dataset, hp=hp)
+                acc   = r['valid_acc'] or 0.0   # SEARCH SIGNAL: validation
+                flops = r['flops_M']   or 0.0
             except Exception as ex:
                 print(f"  [ERROR] query failed: {ex}")
-                r, acc, flops = {'index': -1, 'arch_str': '?'}, 0.0, 0.0
+                r = {'index': -1, 'arch_str': '?', 'valid_acc': 0.0,
+                     'test_acc': 0.0}
+                acc, flops = 0.0, 0.0
 
             nf     = _normFlops(flops, flops_min, flops_max)
             f1, f2 = 1.0 - acc, nf
@@ -1549,7 +1563,8 @@ def runQEHVINASSearch(
                 'arch_index': r.get('index', -1),
                 'arch_str':   r.get('arch_str', '?'),
                 'gene':       ' '.join(str(g) for g in gene),
-                'test_acc':   round(acc, 6),
+                'valid_acc':  round(acc, 6),
+                'test_acc':   round(r.get('test_acc', 0.0), 6),
                 'flops_M':    round(flops, 4),
                 'norm_flops': round(nf, 6),
                 'f1':         round(f1, 6),
@@ -1559,25 +1574,29 @@ def runQEHVINASSearch(
                 'elapsed_s':  round(elapsed, 3),
             })
             all_min_objs.append([f1, f2])
+            all_test_objs.append([1.0 - (r.get('test_acc') or 0.0), nf])
             all_records.append({
                 'gene':       gene,
                 'arch_index': r.get('index', -1),
                 'arch_str':   r.get('arch_str', '?'),
-                'test_acc':   round(acc, 6),
+                'valid_acc':  round(acc, 6),
+                'test_acc':   round(r.get('test_acc', 0.0), 6),
                 'flops_M':    round(flops, 4),
                 'norm_flops': round(nf, 6),
-                'f1':         round(f1, 6),
-                'f2':         round(f2, 6),
+                # reported objectives on TEST; f1_valid is what the GP saw
+                'f1':         round(1.0 - r.get('test_acc', 0.0), 6),
+                'f2':         round(nf, 6),
+                'f1_valid':   round(f1, 6),
             })
             if verbose:
                 print(f"  [{counter['n']:>4}] gene={gene}  "
-                      f"acc={acc:.4f}  flops={flops:.1f}M")
+                      f"valid_acc={acc:.4f}  flops={flops:.1f}M")
         return Y
 
     # ── Initial design (Sobol) ────────────────────────────────────────────
     train_x   = draw_sobol_samples(bounds=std_bounds, n=init_points, q=1, seed=seed).squeeze(1).to(**tkwargs)
     train_obj = _evaluate_unit(train_x)
-    hv_history.append(float(hv_indicator(np.asarray(all_min_objs))))
+    hv_history.append(_hvOfArchive(all_test_objs))
 
     # ── BO loop ───────────────────────────────────────────────────────────
     log_every = max(1, n_iter // 10)
@@ -1613,7 +1632,7 @@ def runQEHVINASSearch(
         train_x   = torch.cat([train_x, candidates.detach().to(**tkwargs)], dim=0)
         train_obj = torch.cat([train_obj, new_obj], dim=0)
 
-        cur_hv = float(hv_indicator(np.asarray(all_min_objs)))
+        cur_hv = _hvOfArchive(all_test_objs)
         hv_history.append(cur_hv)
         if (it + 1) % log_every == 0 or it == n_iter - 1:
             print(f"  iter {it + 1:>3}/{n_iter}  evals={counter['n']:>4}  "
@@ -1674,6 +1693,7 @@ def runQEHVINASSearch(
         index=False)
 
     print(f"  Saved: {json_path}")
+    gc.collect()   # the run's eval log is dead by here; reclaim it
     return pareto_front, run_results
 
 
