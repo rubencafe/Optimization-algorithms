@@ -889,15 +889,44 @@ def runBONASSearch(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def benchmarkUpperBound(api, dataset='cifar10', hp='200',
-                        fitness_key='test_acc', verbose=True):
+                        fitness_key='test_acc', front_dir=None, verbose=True):
     """Return the (architecture, accuracy) of the globally best architecture
     in NAS-Bench-201 for the chosen dataset.
 
     This is the *gold standard* against which any search algorithm should be
-    compared: with only 15625 architectures, the optimum can be found by
-    exhaustive enumeration in seconds.
+    compared.
+
+    Two routes, in order:
+
+    1. ``front_dir/true_front_<dataset>.json`` — the exhaustive Pareto front, if
+       it has already been computed. The most accurate architecture is
+       non-dominated by construction (nothing beats it on accuracy), so it is
+       always on that front: reading the maximum from it gives exactly the same
+       answer as enumerating, instantly and at no memory cost.
+    2. Enumerating all 15,625 cells. Each architecture the API loads costs
+       ~1.8 MiB and NATS-Bench never evicts, so a bare loop would retain some
+       27 GB; every index is therefore released as soon as it has been read.
     """
     info_key = 'test-accuracy' if fitness_key == 'test_acc' else 'valid-accuracy'
+
+    if front_dir is not None and fitness_key == 'test_acc':
+        path = os.path.join(str(front_dir), f'true_front_{dataset}.json')
+        if os.path.exists(path):
+            with open(path) as fh:
+                front = json.load(fh)
+            if front:
+                top = max(front, key=lambda p: p.get('test_acc') or 0.0)
+                best = {'index': top.get('index'),
+                        'arch_str': top.get('arch_str'),
+                        fitness_key: float(top.get('test_acc') or 0.0)}
+                if verbose:
+                    print(f"NAS-Bench-201 upper bound on {dataset} "
+                          f"(hp={hp}, {fitness_key}), from {os.path.basename(path)}:")
+                    print(f"  index    : {best['index']}")
+                    print(f"  arch_str : {best['arch_str']}")
+                    print(f"  {fitness_key}: {best[fitness_key]:.4f}")
+                return best
+
     best = {'index': None, 'arch_str': None, fitness_key: -1.0}
     for index in range(N_ARCHS):
         info = api.get_more_info(index, dataset, hp=hp, is_random=False)
@@ -908,6 +937,8 @@ def benchmarkUpperBound(api, dataset='cifar10', hp='200',
                 'arch_str':    api.arch(index),
                 fitness_key:   acc,
             })
+        # Without this the loop retains every architecture it touches.
+        _releaseApiParams(api, index, hp)
     if verbose:
         print(f"NAS-Bench-201 upper bound on {dataset} (hp={hp}, {fitness_key}):")
         print(f"  index    : {best['index']}")

@@ -1223,7 +1223,14 @@ def runBOMONASScalarized(
     def _bo_obj(e0, e1, e2, e3, e4, e5):
         return -mo_obj([e0, e1, e2, e3, e4, e5])
 
-    pbounds = {f'e{j}': (0, N_OPS - 1) for j in range(N_EDGES)}
+    # Declare the six edges as integer variables, matching
+    # runBONASSearch. The space is discrete either way -- the
+    # objective rounds before querying -- but with the type
+    # declared, bayes_opt registers the rounded point, so it can
+    # see that a proposal repeats an architecture it already
+    # evaluated instead of treating two nearby continuous points
+    # as distinct observations.
+    pbounds = {f'e{j}': (0, N_OPS - 1, int) for j in range(N_EDGES)}
     acq = acquisition.ExpectedImprovement(xi=xi, random_state=seed)
     bo  = BayesianOptimization(
         f=_bo_obj, pbounds=pbounds,
@@ -1350,7 +1357,14 @@ def runBOMONASScalarizedSweep(
             fit = mealpy_obj([e0, e1, e2, e3, e4, e5])
             return -fit   # maximise negative fitness
 
-        pbounds = {f'e{j}': (0, N_OPS - 1) for j in range(N_EDGES)}
+        # Declare the six edges as integer variables, matching
+        # runBONASSearch. The space is discrete either way -- the
+        # objective rounds before querying -- but with the type
+        # declared, bayes_opt registers the rounded point, so it can
+        # see that a proposal repeats an architecture it already
+        # evaluated instead of treating two nearby continuous points
+        # as distinct observations.
+        pbounds = {f'e{j}': (0, N_OPS - 1, int) for j in range(N_EDGES)}
         acq     = acquisition.ExpectedImprovement(xi=xi, random_state=run_seed)
         bo      = BayesianOptimization(
             f=_bo_obj, pbounds=pbounds,
