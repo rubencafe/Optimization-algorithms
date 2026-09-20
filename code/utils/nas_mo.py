@@ -658,7 +658,7 @@ def runNSGAIINASSearch(
     result = minimize(
         problem,
         algorithm,
-        termination=('n_gen', n_generations),
+        termination=('n_gen', n_generations + 1),
         seed=seed,
         verbose=False,
         callback=hv_cb,
@@ -801,7 +801,7 @@ def _runPymooMONASSearch(
     result = minimize(
         problem,
         algorithm,
-        termination=('n_gen', n_generations),
+        termination=('n_gen', n_generations + 1),
         seed=seed,
         verbose=False,
         callback=hv_cb,
