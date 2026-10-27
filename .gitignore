@@ -216,3 +216,6 @@ __marimo__/
 results/
 writing/
 claudeMemory.md
+# Notebooks and local environment (kept out of the repo)
+*.ipynb
+Dockerfile

@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import multiprocessing as mp
@@ -7,6 +6,10 @@ import numpy as np
 
 
 def _getActivationLayer(activation):
+    """Return the Keras activation layer for a name.
+
+    activation: activation name, e.g. 'relu' or 'leaky_relu'.
+    """
     from keras import layers
     if activation == 'leaky_relu':
         return layers.LeakyReLU()
@@ -14,6 +17,11 @@ def _getActivationLayer(activation):
 
 
 def _getOptimizer(name, learning_rate):
+    """Return the Keras optimizer for a name.
+
+    name: 'adamw', 'sgd' (with Nesterov momentum) or 'rmsprop'.
+    learning_rate: optimizer learning rate.
+    """
     from keras.optimizers import SGD, AdamW, RMSprop
     name = name.lower()
     if name == 'sgd':
@@ -24,28 +32,25 @@ def _getOptimizer(name, learning_rate):
 
 
 def buildTemplateCNN(config, input_shape, num_classes):
-    # Imports are function-local so merely importing `worker` in the
-    # parent does not drag TensorFlow/Keras into parent memory.
+    """Build and compile the Study 1 VGG-style CNN for one configuration.
+
+    config: configuration dict from decodeSolution.
+    input_shape: shape of one input image.
+    num_classes: number of output classes.
+    """
     from keras import layers, models
 
     k       = config['kernel_size']
     pool_fn = layers.AveragePooling2D if config['pooling'] == 'average' else layers.MaxPooling2D
     base    = config['base_filters']
 
-    # VGG doubling rule — design principle, NOT a search dimension.
-    # With n_blocks=3 and base=64 -> [64, 128, 256].
     n_blocks = config['n_blocks']
     filters  = [base * (2 ** i) for i in range(n_blocks)]
 
     model = models.Sequential(name='Template_CNN')
     model.add(layers.Input(shape=input_shape))
 
-    # Batch normalization is ALWAYS applied after every convolution:
-    # design principle, not a search dimension (Ioffe & Szegedy, 2015;
-    # Santurkar et al., 2018). See FIXED_BN in optimizer.py for the
-    # methodological justification.
     for n_filters in filters:
-        # Double conv per block (VGG-style)
         model.add(layers.Conv2D(n_filters, (k, k), padding='same'))
         model.add(layers.BatchNormalization())
         model.add(_getActivationLayer(config['activation']))
@@ -56,7 +61,6 @@ def buildTemplateCNN(config, input_shape, num_classes):
 
         model.add(pool_fn((2, 2)))
 
-    # Classifier head (also topologically fixed)
     model.add(layers.Flatten())
     model.add(layers.Dense(config['dense_units']))
     model.add(_getActivationLayer(config['activation']))
@@ -75,11 +79,13 @@ def buildTemplateCNN(config, input_shape, num_classes):
     return model
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Dataset serialisation (called once in the parent)
-# ─────────────────────────────────────────────────────────────────────────────
-
 def prepareDataFile(data, dir_path: str = '/tmp/hpo_data') -> dict:
+    """Save the train and test arrays as .npy files for the child processes and
+    return their paths.
+
+    data: dataset dict from getDataset.
+    dir_path: folder where the files are written.
+    """
     os.makedirs(dir_path, exist_ok=True)
     paths = {
         'x_train':     os.path.join(dir_path, 'x_train.npy'),
@@ -96,60 +102,33 @@ def prepareDataFile(data, dir_path: str = '/tmp/hpo_data') -> dict:
     return paths
 
 
-def cleanupDataFile(paths: dict) -> None:
-    for key in ('x_train', 'y_train', 'x_test', 'y_test'):
-        path = paths.get(key)
-        if path and os.path.exists(path):
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-    dir_path = os.path.dirname(paths.get('x_train', '') or '')
-    if dir_path and os.path.isdir(dir_path):
-        try:
-            os.rmdir(dir_path)
-        except OSError:
-            pass
-
-
 def _childFn(config, data_paths, eval_epochs, seed, queue):
-    """Run a single CNN build+fit; return ('status', val_acc) via `queue`."""
-    # ── Silence TF / CUDA / absl startup noise ──────────────────────────────
-    # These messages ("cuFFT/cuDNN/cuBLAS factory already registered", "XLA
-    # service initialized", "Created device", etc.) are emitted from C++
-    # *before* absl initialises its Python bindings — the literal warning
-    # "All log messages before absl::InitializeLog() is called are written
-    # to STDERR" confirms it. That means TF_CPP_MIN_LOG_LEVEL, absl.logging,
-    # and tf.get_logger() all arrive too late to catch them.
-    #
-    # The only reliable fix is to redirect file descriptor 2 (stderr) at
-    # the OS level BEFORE importing tensorflow. This also silences any
-    # future C++ noise regardless of which library emits it. The trade-off
-    # is that genuine C++ stack traces would also disappear — but our
-    # Python-level try/except still captures exceptions via the queue,
-    # so diagnostic information about eval success/failure is preserved.
+    """Build and train one CNN in a child process and put ('ok', accuracy),
+    ('oom', msg) or ('error', msg) on the queue.
+
+    config: configuration dict from decodeSolution.
+    data_paths: dict from prepareDataFile.
+    eval_epochs: training epochs.
+    seed: random seed of the evaluation.
+    queue: multiprocessing queue that receives the result.
+    """
     import sys as _sys
     _sys.stderr.flush()
     _devnull_fd = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(_devnull_fd, 2)   # redirect OS-level stderr → /dev/null
+    os.dup2(_devnull_fd, 2)
     os.close(_devnull_fd)
 
-    # Belt-and-braces: also set the env vars so any child-of-child that
-    # inspects them behaves quietly, and in case a future TF release
-    # honours them before first-stderr-write.
-    os.environ['TF_CPP_MIN_LOG_LEVEL']   = '3'   # 0=all, 3=fatal only
+    os.environ['TF_CPP_MIN_LOG_LEVEL']   = '3'
     os.environ['TF_ENABLE_ONEDNN_OPTS']  = '0'
     os.environ['GRPC_VERBOSITY']         = 'ERROR'
     os.environ['GLOG_minloglevel']       = '2'
     os.environ['AUTOGRAPH_VERBOSITY']    = '0'
 
-    # Deterministic per-child seeding (still before any TF import).
     os.environ['PYTHONHASHSEED'] = str(seed)
     import random
     random.seed(seed)
     np.random.seed(seed)
 
-    # Python-side absl logger — handles the W0000/E0000/I0000 lines.
     try:
         import logging
         import absl.logging
@@ -158,7 +137,6 @@ def _childFn(config, data_paths, eval_epochs, seed, queue):
     except Exception:
         pass
 
-    # Import TF inside the child — parent never touches it.
     import tensorflow as tf
     tf.get_logger().setLevel('ERROR')
     tf.autograph.set_verbosity(0)
@@ -168,12 +146,9 @@ def _childFn(config, data_paths, eval_epochs, seed, queue):
         try:
             tf.config.experimental.set_memory_growth(gpu, True)
         except RuntimeError:
-            # Already configured — harmless.
             pass
 
     try:
-        # Load preprocessed arrays from disk. Linux page cache makes
-        # subsequent loads effectively free across sibling processes.
         x_train     = np.load(data_paths['x_train'])
         y_train     = np.load(data_paths['y_train'])
         x_test      = np.load(data_paths['x_test'])
@@ -181,9 +156,6 @@ def _childFn(config, data_paths, eval_epochs, seed, queue):
         input_shape = tuple(data_paths['input_shape'])
         num_classes = int(data_paths['num_classes'])
 
-        # `buildTemplateCNN` is defined in *this* module (above),
-        # so no external import is required. This is what makes the
-        # file self-contained / drop-in on Kaggle.
         model = buildTemplateCNN(config, input_shape, num_classes)
 
         history = model.fit(
@@ -197,17 +169,11 @@ def _childFn(config, data_paths, eval_epochs, seed, queue):
         queue.put(('ok', val_acc))
 
     except tf.errors.ResourceExhaustedError as e:
-        # GPU OOM — config is too big for the available VRAM.
         queue.put(('oom', str(e)[:300]))
 
     except Exception as e:
-        # Any other error (graph build failure, NaN loss, etc.).
         queue.put(('error', f"{type(e).__name__}: {str(e)[:300]}"))
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Parent-side API
-# ─────────────────────────────────────────────────────────────────────────────
 
 def evalWorker(
     config: dict,
@@ -217,6 +183,16 @@ def evalWorker(
     seed: int = 42,
     start_method: str = 'spawn',
 ) -> tuple:
+    """Evaluate one configuration in a fresh subprocess and return its (status,
+    value) pair.
+
+    config: configuration dict from decodeSolution.
+    data_paths: dict from prepareDataFile.
+    eval_epochs: training epochs.
+    timeout: seconds before the child process is killed.
+    seed: random seed of the evaluation.
+    start_method: multiprocessing start method.
+    """
     ctx   = mp.get_context(start_method)
     queue = ctx.Queue()
     proc  = ctx.Process(
@@ -226,7 +202,6 @@ def evalWorker(
     proc.start()
     proc.join(timeout=timeout)
 
-    # Timeout path: child still running when we expected it to finish.
     if proc.is_alive():
         proc.terminate()
         proc.join(timeout=5)
@@ -236,7 +211,6 @@ def evalWorker(
         _drainQueue(queue)
         return ('timeout', f'child exceeded {timeout}s')
 
-    # Normal path: child exited; check whether it produced a result.
     try:
         if not queue.empty():
             return queue.get_nowait()
@@ -246,7 +220,10 @@ def evalWorker(
 
 
 def _drainQueue(q) -> None:
-    """Empty a queue silently — avoids resource warnings on close."""
+    """Empty a queue so it closes without resource warnings.
+
+    q: multiprocessing queue.
+    """
     try:
         while not q.empty():
             try:

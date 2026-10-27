@@ -1,45 +1,3 @@
-"""
-optimizer_bo.py
----------------
-Bayesian-Optimization baseline for the same HPO problem as utils/optimizer.py.
-
-This module is a drop-in companion to ``runOptimization`` (mealpy-based
-evolutionary algorithms) that uses Gaussian-Process Bayesian Optimization
-via Fernando Nogueira's ``bayesian-optimization`` package
-(https://bayesian-optimization.github.io/BayesianOptimization/) with the
-Expected Improvement acquisition function.
-
-It mirrors the protocol of the EA baseline so all results are directly
-comparable:
-
-    - Same search space (7 categorical hyperparameters, encoded as integer
-      indices into the option lists exposed by ``utils.optimizer``)
-    - Same fitness function (``1 - val_accuracy`` after ``eval_epochs``
-      epochs); internally the GP maximizes val_accuracy directly because
-      ``bayesian-optimization`` is a maximizer.
-    - Same evaluation budget (default 220 trials = 20 random init points
-      + 200 BO-guided iterations)
-    - Same per-evaluation log structure (JSON + CSV) and same JSON output
-      schema, so existing aggregation / plotting code works unchanged
-    - Same per-evaluation cleanup (clear_session + gc.collect) to avoid
-      the host-RAM leak that affects long Keras/TF runs
-
-Quick usage:
-
-    from utils.datasets      import getDataset
-    from utils.optimizer_bo  import runBOOptimization
-
-    data = getDataset('mnist')
-    best, run = runBOOptimization(
-        data,
-        eval_epochs = 1,
-        n_iter      = 200,
-        init_points = 20,
-        seed        = 0,
-        results_dir = 'colab/results/bo',
-    )
-"""
-
 import gc
 import json
 import os
@@ -67,13 +25,10 @@ _PROC = psutil.Process(os.getpid())
 
 
 def _hostRamGB():
+    """Return the resident memory of this Python process, in GB."""
     return _PROC.memory_info().rss / 1024 ** 3
 
 
-# Search-space bounds for bayesian-optimization. We use integer indices
-# (third tuple element ``int``) so that the GP kernel is rounding-aware
-# and the kernel-space dimension stays at 7 (instead of one-hot exploding
-# to 18 dimensions).
 BO_PBOUNDS = {
     'batch_idx':     (0, len(BATCH_SIZES)   - 1, int),
     'filters_idx':   (0, len(FILTER_OPTS)   - 1, int),
@@ -87,15 +42,17 @@ BO_PBOUNDS = {
 
 def _decodeIndices(batch_idx, filters_idx, n_blocks_idx, dense_idx,
                    optimizer_idx, pooling_idx, kernel_idx):
-    """Decode integer indices into the same config dict produced by
-    ``utils.optimizer.decodeSolution``."""
+    """Turn the 7 BO parameters into the same configuration dict as
+    decodeSolution.
+
+    batch_idx, filters_idx, n_blocks_idx, dense_idx, optimizer_idx,
+        pooling_idx, kernel_idx: option indices.
+    """
     return {
-        # Fixed hyperparameters
         'learning_rate': FIXED_LR,
         'dropout_rate':  FIXED_DROPOUT,
         'activation':    FIXED_ACTIVATION,
         'use_bn':        FIXED_BN,
-        # Tuned
         'batch_size':    BATCH_SIZES   [int(batch_idx)],
         'base_filters':  FILTER_OPTS   [int(filters_idx)],
         'n_blocks':      N_BLOCKS_OPTS [int(n_blocks_idx)],
@@ -106,20 +63,22 @@ def _decodeIndices(batch_idx, filters_idx, n_blocks_idx, dense_idx,
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Objective
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _makeBOObjective(data, eval_epochs, eval_log, counter):
-    """Closure returning an objective compatible with
-    ``BayesianOptimization`` (keyword-arg signature, maximizes target).
+    """Build the BO objective that trains a CNN and returns its accuracy (BO
+    maximizes).
 
-    Returns ``val_accuracy`` directly because the library maximises; the
-    fitness (``1 - val_accuracy``) is logged alongside for consistency
-    with the EA baseline log format.
+    data: dataset dict from getDataset.
+    eval_epochs: training epochs per evaluation.
+    eval_log: list that receives one record per evaluation.
+    counter: dict holding the evaluation count and best accuracy so far.
     """
 
     def objective(batch_idx, filters_idx, n_blocks_idx, dense_idx, optimizer_idx, pooling_idx, kernel_idx):
+        """Train the CNN of one BO point and return its accuracy.
+
+        batch_idx, filters_idx, n_blocks_idx, dense_idx, optimizer_idx,
+            pooling_idx, kernel_idx: option indices proposed by BO.
+        """
         config = _decodeIndices(
             batch_idx, filters_idx, n_blocks_idx, dense_idx,
             optimizer_idx, pooling_idx, kernel_idx,
@@ -149,7 +108,6 @@ def _makeBOObjective(data, eval_epochs, eval_log, counter):
             print(f"  [ERROR] trial={counter['n']+1} - {type(e).__name__}: {e}")
             val_acc = 0.0
 
-        # ── Aggressive per-evaluation cleanup ─────────────────────────────
         try:
             if model is not None and hasattr(model, 'optimizer'):
                 model.optimizer = None
@@ -203,15 +161,10 @@ def _makeBOObjective(data, eval_epochs, eval_log, counter):
               f"k={config['kernel_size']}  dt={dt:.0f}s  t={elapsed:.0f}s  "
               f"ram={ram_gb:.2f}GB")
 
-        # Library MAXIMIZES — return the accuracy directly.
         return val_acc
 
     return objective
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Public entry point
-# ─────────────────────────────────────────────────────────────────────────────
 
 def runBOOptimization(
     data,
@@ -223,40 +176,18 @@ def runBOOptimization(
     results_dir  = 'results/bo',
     extra_info   = True,
 ):
-    """Run a full HPO loop with GP-based Bayesian Optimization.
+    """Run the GP-based Bayesian Optimization baseline and save the result JSON
+    and evaluation log CSV.
 
-    Parameters
-    ----------
-    data : dict
-        Dataset dict as returned by ``utils.datasets.getDataset``.
-    eval_epochs : int, default 1
-        Number of epochs used to score each candidate (same as the EA
-        baselines for a fair comparison).
-    n_iter : int, default 200
-        Number of BO-guided iterations after the random initialization.
-        The total budget is ``init_points + n_iter`` (default ``20 + 200
-        = 220``, matching the EA budget of 20 initial individuals + 10
-        generations of 20 offspring).
-    init_points : int, default 20
-        Random points sampled before the GP starts proposing.
-    xi : float, default 0.01
-        Exploration trade-off parameter for the Expected Improvement
-        acquisition function.
-    seed : int or None
-        If None, a fresh seed is drawn from OS entropy. Persisted in the
-        output JSON so the run is reproducible.
-    results_dir : str
-        Folder where the JSON and CSV are written.
-    extra_info : bool
-        Print a final summary block.
-
-    Returns
-    -------
-    best_config : dict
-        Same schema as the EA baselines' ``best['config']``.
-    run_results : dict
-        Same schema as the EA baselines' ``run_results``, so the existing
-        aggregation/plotting code in ``utils.evaluation`` works unchanged.
+    data: dataset dict from getDataset.
+    eval_epochs: training epochs per evaluation.
+    n_iter: BO iterations after the random start; the budget is init_points +
+        n_iter.
+    init_points: random points evaluated before the GP starts proposing.
+    xi: exploration parameter of Expected Improvement.
+    seed: random seed; drawn at random and saved with the results when None.
+    results_dir: folder for the output files.
+    extra_info: print a final summary.
     """
     if seed is None:
         seed = int(np.random.SeedSequence().entropy % (2 ** 31 - 1))
@@ -289,14 +220,13 @@ def runBOOptimization(
         pbounds              = BO_PBOUNDS,
         acquisition_function = acq,
         random_state         = seed,
-        verbose              = 0,        # we print our own per-iteration line
+        verbose              = 0,
     )
 
     t_start = time.time()
     bo.maximize(init_points=init_points, n_iter=n_iter)
     t_total = time.time() - t_start
 
-    # Library's max is val_accuracy; convert back to the EA-style fitness.
     best_val_acc = float(bo.max['target'])
     best_fitness = 1.0 - best_val_acc
     best_params  = bo.max['params']

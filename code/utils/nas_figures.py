@@ -1,29 +1,3 @@
-"""Publication figures for the revised NAS-Bench-201 study.
-
-Regenerates every figure the paper uses, from the results the revised pipeline
-writes. One function per figure; :func:`makeAll` runs the lot.
-
-    from utils.nas_figures import makeAll
-    makeAll(RESULTS, DATASETS, out_dir=RESULTS / 'figures')
-
-Figure names match the ``\\includegraphics`` keys in ``article.tex``:
-
-    cs1_gap_grid                 distance to the exhaustive upper bound
-    cs1_scalar_fronts_<method>   scalarized non-dominated sets vs exact front
-    cs1_alpha_sweep_<method>     accuracy-cost trajectory as alpha is swept
-    cs2_fronts_nat               native Pareto fronts vs exact front
-    cs2_hv_convergence_native    hypervolume vs evaluations
-    proposals_vs_unique          budget spent on distinct architectures  (NEW)
-    unique_per_dataset           the same, split by dataset              (NEW)
-
-Everything is driven by the per-proposal eval logs, so the search is scored on
-validation accuracy while every plotted quantity is reported on test accuracy.
-
-Self-test (synthetic results tree, no benchmark needed)::
-
-    python -m utils.nas_figures
-"""
-
 from __future__ import annotations
 
 import json
@@ -52,6 +26,9 @@ DS_LABEL = {'cifar10': 'CIFAR-10', 'cifar100': 'CIFAR-100',
 
 
 def _plt():
+    """Import matplotlib.pyplot, using the Agg backend when there is no
+    display.
+    """
     import matplotlib
     if not os.environ.get('DISPLAY') and os.name != 'nt':
         matplotlib.use('Agg')
@@ -60,6 +37,12 @@ def _plt():
 
 
 def _save(fig, out_dir, name):
+    """Save a figure as PDF and PNG and return the two paths.
+
+    fig: matplotlib figure.
+    out_dir: output folder.
+    name: file name without extension.
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     paths = []
@@ -70,17 +53,23 @@ def _save(fig, out_dir, name):
     return paths
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Loading
-# ─────────────────────────────────────────────────────────────────────────────
-
 def loadManifest(results_dir):
+    """Load manifest.csv (one row per run), or an empty DataFrame when it does
+    not exist.
+
+    results_dir: results folder.
+    """
     p = Path(results_dir) / 'manifest.csv'
     return pd.read_csv(p) if p.exists() else pd.DataFrame()
 
 
 def loadRefs(results_dir, datasets):
-    """Reference fronts, FLOPs ranges and accuracy upper bounds per dataset."""
+    """Load the reference front, FLOPs range and accuracy upper bound of each
+    dataset.
+
+    results_dir: results folder with the true_front_<dataset>.json files.
+    datasets: dataset names.
+    """
     refs = {}
     for ds in datasets:
         p = Path(results_dir) / f'true_front_{ds}.json'
@@ -97,17 +86,29 @@ def loadRefs(results_dir, datasets):
 
 
 def loadEvals(stem):
+    """Load the evaluation log of a run, or None when it does not exist.
+
+    stem: file stem of the run, without the _evals.csv suffix.
+    """
     p = Path(str(stem) + '_evals.csv')
     return pd.read_csv(p) if p.exists() else None
 
 
 def _normFlops(flops, ref):
+    """Normalize FLOPs with a dataset's reference range.
+
+    flops: FLOPs in millions.
+    ref: reference entry from loadRefs.
+    """
     span = max(ref['flops_max'] - ref['flops_min'], 1e-12)
     return np.clip((np.asarray(flops) - ref['flops_min']) / span, 0.0, 1.0)
 
 
 def _nonDominated(F):
-    """Indices of the non-dominated rows of an (n, 2) minimization array."""
+    """Return the indices of the non-dominated rows of a minimization array.
+
+    F: (n, 2) objective array.
+    """
     F = np.asarray(F, dtype=float)
     order = np.lexsort((F[:, 1], F[:, 0]))
     keep, best = [], np.inf
@@ -119,6 +120,11 @@ def _nonDominated(F):
 
 
 def _hv(F, ref_point=REF_POINT):
+    """Return the hypervolume of an objective array.
+
+    F: (n, 2) minimized objectives.
+    ref_point: reference point.
+    """
     from pymoo.indicators.hv import HV
     F = np.atleast_2d(np.asarray(F, dtype=float))
     if F.size == 0:
@@ -126,19 +132,18 @@ def _hv(F, ref_point=REF_POINT):
     return float(HV(ref_point=np.array(ref_point))(F))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Figure 1 — cs1_gap_grid
-# ─────────────────────────────────────────────────────────────────────────────
-
 def figGapGrid(results_dir, datasets, refs, out_dir, pop_size=20,
                study='CS1', name='cs1_gap_grid'):
-    """Distance from the running incumbent to the exhaustive upper bound.
+    """Plot, per dataset, the gap between the test accuracy of the best-so-far
+    cell (chosen by validation) and the exhaustive upper bound.
 
-    The incumbent is whichever architecture has the best *validation* accuracy
-    so far — what the search can actually see — and the curve plots that
-    architecture's *test* accuracy against the test upper bound. The floor is
-    therefore a genuine generalization gap, not an artifact of having
-    optimized the test column.
+    results_dir: results folder.
+    datasets: dataset names.
+    refs: references from loadRefs.
+    out_dir: output folder.
+    pop_size: population size, to turn proposals into generations.
+    study: manifest study to plot.
+    name: output file name.
     """
     plt = _plt()
     man = loadManifest(results_dir)
@@ -160,7 +165,6 @@ def figGapGrid(results_dir, datasets, refs, out_dir, pop_size=20,
                 if ev is None or 'valid_acc' not in ev:
                     continue
                 inc = ev['valid_acc'].cummax()
-                # test accuracy of the validation-selected incumbent
                 pick = ev['valid_acc'].expanding().apply(np.argmax, raw=True)
                 test_of_inc = ev['test_acc'].to_numpy()[pick.to_numpy().astype(int)]
                 gap = np.maximum(ref['best_test_acc'] - test_of_inc, 1e-6)
@@ -183,12 +187,12 @@ def figGapGrid(results_dir, datasets, refs, out_dir, pop_size=20,
     return _save(fig, out_dir, name)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Figures 2/3 — scalarized fronts and the alpha sweep
-# ─────────────────────────────────────────────────────────────────────────────
-
 def loadScalarPoints(results_dir, method):
-    """Per-alpha winners saved by the scalarized stage."""
+    """Load the per-alpha winners saved by the scalarized runs.
+
+    results_dir: results folder.
+    method: 'weighted_sum' or 'tchebycheff'.
+    """
     d = Path(results_dir) / 'scalar_points'
     rows = []
     for p in sorted(d.glob(f'{method}_*.json')) if d.is_dir() else []:
@@ -202,7 +206,16 @@ def loadScalarPoints(results_dir, method):
 
 def figScalarFronts(results_dir, datasets, refs, out_dir, method='weighted_sum',
                     name=None):
-    """Non-dominated set assembled from each optimizer's alpha runs."""
+    """Plot the non-dominated set built from each optimizer's alpha runs
+    against the exact front.
+
+    results_dir: results folder.
+    datasets: dataset names.
+    refs: references from loadRefs.
+    out_dir: output folder.
+    method: 'weighted_sum' or 'tchebycheff'.
+    name: output file name; defaults to cs1_scalar_fronts_<method>.
+    """
     plt = _plt()
     df = loadScalarPoints(results_dir, method)
     if not len(df):
@@ -248,7 +261,16 @@ def figScalarFronts(results_dir, datasets, refs, out_dir, method='weighted_sum',
 
 def figAlphaSweep(results_dir, datasets, refs, out_dir, method='weighted_sum',
                   name=None):
-    """Accuracy-cost trajectory as the weight alpha is swept end to end."""
+    """Plot the accuracy-cost trajectory of each optimizer as alpha is swept
+    from 0 to 1.
+
+    results_dir: results folder.
+    datasets: dataset names.
+    refs: references from loadRefs.
+    out_dir: output folder.
+    method: 'weighted_sum' or 'tchebycheff'.
+    name: output file name; defaults to cs1_alpha_sweep_<method>.
+    """
     plt = _plt()
     df = loadScalarPoints(results_dir, method)
     if not len(df):
@@ -266,7 +288,7 @@ def figAlphaSweep(results_dir, datasets, refs, out_dir, method='weighted_sum',
             ax.plot(g['flops_M'], g['test_acc'], '-',
                     marker=ALGO_MARKERS.get(algo, 'o'), ms=4, lw=1.4,
                     color=ALGO_COLORS.get(algo), label=algo.replace('_', '-'))
-            if len(g):   # mark the alpha = 1 endpoint the reviewer asked for
+            if len(g):
                 ax.scatter([g['flops_M'].iloc[-1]], [g['test_acc'].iloc[-1]],
                            s=90, facecolor='none',
                            edgecolor=ALGO_COLORS.get(algo, 'k'), lw=1.4, zorder=4)
@@ -285,11 +307,16 @@ def figAlphaSweep(results_dir, datasets, refs, out_dir, method='weighted_sum',
     return _save(fig, out_dir, name)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Figure 4 — cs2_fronts_nat
-# ─────────────────────────────────────────────────────────────────────────────
-
 def figNativeFronts(results_dir, datasets, refs, out_dir, name='cs2_fronts_nat'):
+    """Plot the fronts of the native multi-objective methods against the exact
+    front.
+
+    results_dir: results folder.
+    datasets: dataset names.
+    refs: references from loadRefs.
+    out_dir: output folder.
+    name: output file name.
+    """
     plt = _plt()
     man = loadManifest(results_dir)
     if not len(man) or 'stem' not in man:
@@ -336,13 +363,18 @@ def figNativeFronts(results_dir, datasets, refs, out_dir, name='cs2_fronts_nat')
     return _save(fig, out_dir, name)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Figure 5 — cs2_hv_convergence_native
-# ─────────────────────────────────────────────────────────────────────────────
-
 def figHVConvergence(results_dir, datasets, refs, out_dir, every=20,
                      name='cs2_hv_convergence_native'):
-    """Hypervolume of the evaluated archive against the number of proposals."""
+    """Plot the hypervolume of the evaluated archive against the number of
+    proposals.
+
+    results_dir: results folder.
+    datasets: dataset names.
+    refs: references from loadRefs.
+    out_dir: output folder.
+    every: proposals between points of the curve.
+    name: output file name.
+    """
     plt = _plt()
     man = loadManifest(results_dir)
     if not len(man) or 'stem' not in man:
@@ -389,18 +421,15 @@ def figHVConvergence(results_dir, datasets, refs, out_dir, every=20,
     return _save(fig, out_dir, name)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Figures 6/7 — duplicate evaluations
-# ─────────────────────────────────────────────────────────────────────────────
-
 def figProposalsUnique(results_dir, out_dir, budget=1020,
                        name='proposals_vs_unique'):
-    """Budget spent on distinct architectures, per optimizer.
+    """Plot, per optimizer, how much of the budget went to distinct
+    architectures.
 
-    Every method gets the same number of objective calls and is left alone to
-    spend it. The filled bar is how much of that budget went to architectures
-    it had not already seen — a measurement of search behaviour, not a defect
-    to be corrected.
+    results_dir: results folder.
+    out_dir: output folder.
+    budget: proposals per run.
+    name: output file name.
     """
     plt = _plt()
     from matplotlib.patches import Patch
@@ -450,6 +479,14 @@ def figProposalsUnique(results_dir, out_dir, budget=1020,
 
 def figUniquePerDataset(results_dir, datasets, out_dir, budget=1020,
                         name='unique_per_dataset'):
+    """Plot the distinct architectures per optimizer, split by dataset.
+
+    results_dir: results folder.
+    datasets: dataset names.
+    out_dir: output folder.
+    budget: proposals per run.
+    name: output file name.
+    """
     plt = _plt()
     man = loadManifest(results_dir)
     d = man.dropna(subset=['n_unique']) if len(man) else man
@@ -481,13 +518,19 @@ def figUniquePerDataset(results_dir, datasets, out_dir, budget=1020,
     return _save(fig, out_dir, name)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Driver
-# ─────────────────────────────────────────────────────────────────────────────
-
 def makeAll(results_dir, datasets, out_dir=None, budget=1020, pop_size=20,
             methods=('weighted_sum', 'tchebycheff'), verbose=True):
-    """Regenerate every paper figure that the available results support."""
+    """Regenerate every figure the available results support and return the
+    written paths per figure.
+
+    results_dir: results folder.
+    datasets: dataset names.
+    out_dir: output folder; defaults to results_dir/figures.
+    budget: proposals per run.
+    pop_size: population size.
+    methods: scalarizations to plot.
+    verbose: print one line per figure.
+    """
     results_dir = Path(results_dir)
     out_dir = Path(out_dir or results_dir / 'figures')
     refs = loadRefs(results_dir, datasets)
@@ -517,7 +560,7 @@ def makeAll(results_dir, datasets, out_dir=None, budget=1020, pop_size=20,
     for label, fn in jobs:
         try:
             paths = fn()
-        except Exception as e:            # a missing stage must not kill the rest
+        except Exception as e:
             if verbose:
                 print(f'  [skip] {label:30} {type(e).__name__}: {e}')
             continue
@@ -528,105 +571,3 @@ def makeAll(results_dir, datasets, out_dir=None, budget=1020, pop_size=20,
         elif verbose:
             print(f'  [skip] {label:30} no data yet')
     return made
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Self-test against a synthetic results tree
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _synth(tmp, datasets=('cifar10', 'cifar100'), seeds=(0, 1), budget=120):
-    rng = np.random.default_rng(0)
-    tmp = Path(tmp)
-    (tmp / 'scalar_points').mkdir(parents=True, exist_ok=True)
-    rows = []
-
-    for ds in datasets:
-        fmin, fmax = 8.0, 220.0
-        acc = rng.uniform(0.5, 0.94, 400)
-        fl = rng.uniform(fmin, fmax, 400)
-        F = np.column_stack([1 - acc, (fl - fmin) / (fmax - fmin)])
-        nd = _nonDominated(F)
-        (tmp / f'true_front_{ds}.json').write_text(json.dumps({
-            'objs': F[nd].tolist(), 'flops_min': fmin, 'flops_max': fmax,
-            'best_test_acc': float(acc.max()), 'front': []}))
-
-        for study, algos in (('CS1', ['GA', 'SADE']),
-                             ('CS2', ['NSGA-II', 'GDE3'])):
-            for algo in algos:
-                for seed in seeds:
-                    d = tmp / algo.lower() / ds
-                    d.mkdir(parents=True, exist_ok=True)
-                    stem = str(d / f'{algo}_{seed}')
-                    n = budget
-                    a = np.clip(rng.normal(0.85, 0.05, n) +
-                                np.linspace(0, 0.06, n), 0, 0.95)
-                    f = rng.uniform(fmin, fmax, n)
-                    pd.DataFrame({'proposal': np.arange(1, n + 1),
-                                  'valid_acc': a + rng.normal(0, .002, n),
-                                  'test_acc': a, 'flops_M': f}).to_csv(
-                        stem + '_evals.csv', index=False)
-                    Fr = np.column_stack([1 - a, (f - fmin) / (fmax - fmin)])
-                    ndr = _nonDominated(Fr)
-                    Path(stem + '.json').write_text(json.dumps({
-                        'algorithm': algo,
-                        'pareto_front': [{'test_acc': float(a[i]),
-                                          'valid_acc': float(a[i]),
-                                          'flops_M': float(f[i])} for i in ndr]}))
-                    uniq = int(rng.integers(int(n * .15), n))
-                    rows.append({'key': f'{study}|{algo}|{ds}|{seed}',
-                                 'study': study, 'algorithm': algo,
-                                 'dataset': ds, 'seed': seed,
-                                 'n_proposals': n, 'n_unique': uniq,
-                                 'stem': stem})
-
-        for method in ('weighted_sum', 'tchebycheff'):
-            for algo in ('GA', 'SADE'):
-                for seed in seeds:
-                    alphas = [0.0, 0.25, 0.5, 0.75, 1.0]
-                    pts = [{'alpha': al,
-                            'test_acc': float(0.60 + 0.30 * al + rng.normal(0, .01)),
-                            'valid_acc': float(0.60 + 0.30 * al),
-                            'flops_M': float(10 + 200 * al)} for al in alphas]
-                    (tmp / 'scalar_points' /
-                     f'{method}_{algo}_{ds}_seed{seed}.json').write_text(
-                        json.dumps({'algorithm': algo, 'dataset': ds,
-                                    'seed': seed, 'method': method,
-                                    'points': pts}))
-
-    pd.DataFrame(rows).to_csv(tmp / 'manifest.csv', index=False)
-    return tmp
-
-
-def selftest():
-    import shutil
-    import tempfile
-    import matplotlib
-    matplotlib.use('Agg')
-
-    tmp = Path(tempfile.mkdtemp(prefix='figtest_'))
-    datasets = ['cifar10', 'cifar100']
-    _synth(tmp, datasets=datasets)
-    print('generating figures from a synthetic results tree...')
-    made = makeAll(tmp, datasets, budget=120, pop_size=20)
-
-    expect = {'cs1_gap_grid', 'cs2_fronts_nat', 'cs2_hv_convergence_native',
-              'proposals_vs_unique', 'unique_per_dataset',
-              'cs1_scalar_fronts_weighted_sum', 'cs1_alpha_sweep_weighted_sum',
-              'cs1_scalar_fronts_tchebycheff', 'cs1_alpha_sweep_tchebycheff'}
-    missing = expect - set(made)
-    empty = [n for n, ps in made.items() if ps[0].stat().st_size < 3000]
-
-    print(f'\n{len(made)}/{len(expect)} figures produced')
-    if missing:
-        print('  MISSING:', sorted(missing))
-    if empty:
-        print('  SUSPICIOUSLY SMALL:', empty)
-    ok = not missing and not empty
-    print('SELFTEST', 'PASSED' if ok else 'FAILED')
-    shutil.rmtree(tmp, ignore_errors=True)
-    return ok
-
-
-if __name__ == '__main__':
-    import sys
-    sys.exit(0 if selftest() else 1)
